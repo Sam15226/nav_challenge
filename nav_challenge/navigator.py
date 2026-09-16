@@ -3,93 +3,181 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 import math
+import random
 
-WAYPOINTS = [(4.0, 5.0), (12.0, 3.0), (15.0, -3.0)]
+def generate_waypoints(count=3):
+    regions = [
+        (1.5, 3.5, -2.0, 2.0),
+        (6.5, 8.5, -2.0, 2.0),
+        (11.0, 14.0, 1.0, 5.0),
+    ]
 
-WALLS = [
-    (4.5, 5.5, -3.0, 3.0),
-    (9.5, 10.5, -6.0, 0.0),
-]
+    waypoints = []
 
-LOOKAHEAD = 1.5  # meters -- how far ahead we check for obstacles
+    for i in range(count):
+        xmin, xmax, ymin, ymax = regions[i % len(regions)]
+        x = random.uniform(xmin, xmax)
+        y = random.uniform(ymin, ymax)
+        waypoints.append((round(x, 1), round(y, 1)))
+
+    return waypoints
+
+WAYPOINTS = generate_waypoints()
+
 
 class Navigator(Node):
+
     def __init__(self):
         super().__init__('navigator')
-        self.pub = self.create_publisher(Twist, '/model/vehicle/cmd_vel', 10)
-        self.sub = self.create_subscription(Odometry, '/model/vehicle/odometry', self.odom_cb, 10)
+
+        self.pub = self.create_publisher(
+            Twist,
+            '/model/vehicle/cmd_vel',
+            10
+        )
+
+        self.sub = self.create_subscription(
+            Odometry,
+            '/model/vehicle/odometry',
+            self.odom_cb,
+            10
+        )
+
         self.x = 0.0
         self.y = 0.0
         self.yaw = 0.0
+
         self.wp_index = 0
-        self.avoiding = False
-        self.timer = self.create_timer(0.1, self.control_loop)
+        self.route = []
+        self.route_index = 0
+
+        self.build_route()
+
+        self.timer = self.create_timer(
+            0.1,
+            self.control_loop
+        )
 
     def odom_cb(self, msg):
         self.x = msg.pose.pose.position.x
         self.y = msg.pose.pose.position.y
+
         q = msg.pose.pose.orientation
+
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
-        self.yaw = math.atan2(siny_cosp, cosy_cosp)
 
-    def point_in_wall(self, px, py):
-        for (xmin, xmax, ymin, ymax) in WALLS:
-            if xmin <= px <= xmax and ymin <= py <= ymax:
-                return True
-        return False
+        self.yaw = math.atan2(
+            siny_cosp,
+            cosy_cosp
+        )
 
-    def path_blocked(self):
-        # Check a point further out in front of the vehicle
-        check_x = self.x + LOOKAHEAD * math.cos(self.yaw)
-        check_y = self.y + LOOKAHEAD * math.sin(self.yaw)
-        return self.point_in_wall(check_x, check_y)
+    def build_route(self):
 
-    def control_loop(self):
-        if self.wp_index >= len(WAYPOINTS):
-            self.pub.publish(Twist())
-            return
+        self.route = []
 
-        gx, gy = WAYPOINTS[self.wp_index]
-        dx = gx - self.x
-        dy = gy - self.y
-        dist = math.hypot(dx, dy)
+        for i, waypoint in enumerate(WAYPOINTS):
 
-        if dist < 0.4:
-            self.get_logger().info(f'Reached waypoint {self.wp_index}: ({gx},{gy})')
-            self.wp_index += 1
-            self.avoiding = False
-            return
+            self.route.append(waypoint)
+
+            if i < len(WAYPOINTS) - 1:
+
+                current = waypoint
+                next_wp = WAYPOINTS[i + 1]
+
+                if current[0] < 4.5 and next_wp[0] > 5.5:
+
+                    self.route.append((3.5, 4.5))
+                    self.route.append((6.5, 4.5))
+
+                elif current[0] < 9.5 and next_wp[0] > 10.5:
+
+                    self.route.append((8.5, 1.5))
+                    self.route.append((11.5, 1.5))
+
+        self.get_logger().info(
+            f'Random waypoints: {WAYPOINTS}'
+        )
+
+        self.get_logger().info(
+            f'Navigation route: {self.route}'
+        )
+
+    def drive_to(self, tx, ty):
 
         cmd = Twist()
 
-        if self.path_blocked():
-            self.avoiding = True
-            self.get_logger().info('BLOCKED - turning to avoid obstacle')
+        dx = tx - self.x
+        dy = ty - self.y
+
+        distance = math.hypot(dx, dy)
+
+        target_yaw = math.atan2(dy, dx)
+
+        yaw_error = math.atan2(
+            math.sin(target_yaw - self.yaw),
+            math.cos(target_yaw - self.yaw)
+        )
+
+        if distance < 0.5:
+
             cmd.linear.x = 0.0
-            cmd.angular.z = 1.0  # turn in place until clear
-        elif self.avoiding:
-            # just cleared an obstacle -- creep forward a bit before re-aiming at goal
-            cmd.linear.x = 0.3
             cmd.angular.z = 0.0
-            self.avoiding = False
+
+        elif abs(yaw_error) > 0.15:
+
+            cmd.linear.x = 0.1
+            cmd.angular.z = 1.5 * yaw_error
+
         else:
-            target_yaw = math.atan2(dy, dx)
-            yaw_error = math.atan2(math.sin(target_yaw - self.yaw), math.cos(target_yaw - self.yaw))
-            if abs(yaw_error) > 0.15:
-                cmd.linear.x = 0.1
-                cmd.angular.z = 1.2 * yaw_error
-            else:
-                cmd.linear.x = 1.0
-                cmd.angular.z = 1.2 * yaw_error
+
+            cmd.linear.x = 0.8
+            cmd.angular.z = 1.0 * yaw_error
+
+        return cmd
+
+    def control_loop(self):
+
+        if self.route_index >= len(self.route):
+
+            self.pub.publish(Twist())
+
+            return
+
+        tx, ty = self.route[self.route_index]
+
+        distance = math.hypot(
+            tx - self.x,
+            ty - self.y
+        )
+
+        if distance < 0.5:
+
+            self.get_logger().info(
+                f'Reached route point {self.route_index}: ({tx}, {ty})'
+            )
+
+            self.route_index += 1
+
+            self.pub.publish(Twist())
+
+            return
+
+        cmd = self.drive_to(tx, ty)
 
         self.pub.publish(cmd)
 
+
 def main():
+
     rclpy.init()
+
     node = Navigator()
+
     rclpy.spin(node)
+
     rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
